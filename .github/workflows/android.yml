@@ -1,4 +1,4 @@
-name: Full: extract .7z, flatten ModTemplate, ensure Dobby, build
+name: Full extract .7z, flatten ModTemplate, ensure Dobby, build
 
 on:
   workflow_dispatch:
