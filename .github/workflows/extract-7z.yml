@@ -1,4 +1,4 @@
-name: Extract 7z in repo
+name: Flatten ModTemplate into repo root
 
 on:
   workflow_dispatch:
@@ -7,38 +7,52 @@ permissions:
   contents: write
 
 jobs:
-  extract:
+  flatten:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install 7zip
-        run: sudo apt-get update && sudo apt-get install -y p7zip-full
-
-      - name: Extract 7z into repo root
+      - name: Find ModTemplate and move its contents to repo root
         run: |
-          7z x your-archive.7z -o. -y
+          set -euo pipefail
 
-      # OPTIONAL: flatten if archive creates a single top folder
-      - name: Flatten extracted folder
-        run: |
-          top=$(ls -1 | head -n 1)
-          if [ -d "$top" ] && [ "$(ls -1 | wc -l)" -eq 1 ]; then
-            shopt -s dotglob
-            mv "$top"/* .
-            rm -rf "$top"
+          # find first ModTemplate (ignore .git)
+          MODDIR=$(find . -type d -name 'ModTemplate' -not -path './.git/*' -print -quit || true)
+
+          if [ -z "$MODDIR" ]; then
+            echo "No ModTemplate folder found. Exiting."
+            exit 0
           fi
 
-      # OPTIONAL: delete the archive after extraction
-      - name: Remove archive
-        run: rm your-archive.7z
+          echo "Found ModTemplate at: $MODDIR"
 
-      - name: Commit and push changes
+          # safety: don't try to move if it's the repo root
+          if [ "$MODDIR" = "." ] || [ "$MODDIR" = "./" ]; then
+            echo "ModTemplate is repo root — nothing to move."
+            exit 0
+          fi
+
+          # enable moving dotfiles
+          # move everything (non-dot and dotfiles). suppress errors if pattern empty.
+          shopt -s dotglob || true
+          mv "$MODDIR"/* . 2>/dev/null || true
+          mv "$MODDIR"/.[!.]* . 2>/dev/null || true
+
+          # remove the now-empty ModTemplate folder
+          rm -rf "$MODDIR"
+
+          echo "Contents moved to repo root and $MODDIR removed."
+
+      - name: Commit & push changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add .
-          git commit -m "Extract 7z into repo root" || echo "Nothing to commit"
+          git commit -m "Flatten ModTemplate: move its contents into repo root and remove folder" || echo "No changes to commit"
           git push
