@@ -1,76 +1,41 @@
-name: Android CI
+name: Build Android .so
 
 on:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout repo (NO submodules needed)
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - uses: actions/checkout@v4
+      with:
+        submodules: true   # REQUIRED if you use extern libs
 
-      # 2️⃣ Set up Java (required for Gradle)
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
 
-      # 3️⃣ Install Android SDK + NDK
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
 
-      - name: Install Android NDK & CMake
-        run: |
-          sdkmanager \
-            "ndk;26.1.10909125" \
-            "cmake;3.22.1"
+    - name: Accept licenses
+      run: yes | sdkmanager --licenses
 
-      # 4️⃣ 🔥 ENSURE DOBBY EXISTS (THIS FIXES YOUR ERROR)
-      - name: Clone Dobby dependency
-        run: |
-          set -euo pipefail
+    - name: Install NDK + CMake
+      run: |
+        sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
 
-          DOBBY_PATH="app/src/main/cpp/extern/Dobby"
+    - name: Build native libs
+      run: ./gradlew :app:assembleDebug
 
-          if [ ! -d "$DOBBY_PATH" ]; then
-            echo "Dobby not found, cloning..."
-            mkdir -p app/src/main/cpp/extern
-            git clone --depth 1 https://github.com/jmpews/Dobby.git "$DOBBY_PATH"
-          else
-            echo "Dobby already exists"
-          fi
-
-          echo "Verifying Dobby contents:"
-          ls -la "$DOBBY_PATH"
-
-      # 5️⃣ Make Gradle executable
-      - name: Make Gradle executable
-        run: chmod +x ./gradlew
-
-      # 6️⃣ Clean build (forces CMake reconfigure)
-      - name: Clean project
-        run: ./gradlew clean
-
-      # 7️⃣ 🔨 FULL BUILD (Gradle + CMake)
-      - name: Build Debug APK
-        run: |
-          ./gradlew assembleDebug \
-            --stacktrace \
-            --no-daemon \
-            --warning-mode all
-
-      # 8️⃣ Upload APK (optional)
-      - name: Upload APK
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+    - name: Upload .so
+      uses: actions/upload-artifact@v4
+      with:
+        name: native-libs
+        path: |
+          app/build/intermediates/cxx/**/obj/**/*.so
