@@ -35,8 +35,9 @@ jobs:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
+         fetch-depth: 0
+         submodules: recursive
+
 
       - name: Ensure Dobby exists (clone if missing and allowed)
         run: |
