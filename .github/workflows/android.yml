@@ -1,30 +1,39 @@
-name: Android CI
+# Insert into your job BEFORE running ./gradlew build
+- name: Show C++ source tree & CMakeLists
+  run: |
+    echo ">>> app/src/main/cpp tree"
+    find app/src/main/cpp -maxdepth 3 -type f -print || true
+    echo ">>> show CMakeLists first 200 lines"
+    sed -n '1,200p' app/src/main/cpp/CMakeLists.txt || true
 
-on: [push, pull_request, workflow_dispatch]
+- name: Build with Gradle (verbose native logs)
+  id: gradle_build
+  run: |
+    set -o pipefail
+    # Run assembleDebug (or build) with info/stacktrace to surface native compile errors
+    ./gradlew :app:assembleDebug --stacktrace --info 2>&1 | tee gradle_full.log
+  continue-on-error: true
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+# Collect generated native build logs and upload for inspection
+- name: Gather native build logs
+  if: always()
+  run: |
+    mkdir -p build_debug_logs
+    cp gradle_full.log build_debug_logs/ || true
+    # copy any CMake/Ninja outputs created by the build
+    find app/.cxx -maxdepth 6 -type f -name '*.log' -print -exec cp --parents {} build_debug_logs/ \; || true
+    find app/.cxx -maxdepth 6 -type f -name 'CMakeOutput.log' -print -exec cp --parents {} build_debug_logs/ \; || true
+    find app/.cxx -maxdepth 6 -type f -name 'CMakeError.log' -print -exec cp --parents {} build_debug_logs/ \; || true
+    # capture build.ninja and CMakeFiles if present
+    find app/.cxx -type f -name 'build.ninja' -print -exec cp --parents {} build_debug_logs/ \; || true
+    tar -czf build_debug_logs.tgz build_debug_logs || true
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: gradle
-
-      # REMOVE this step if Dobby is a submodule
-      - name: Clone Dobby (only if not in repo)
-        run: |
-          if [ ! -d app/src/main/cpp/extern/Dobby ]; then
-            mkdir -p app/src/main/cpp/extern
-            git clone https://github.com/jmpews/Dobby.git app/src/main/cpp/extern/Dobby
-          fi
-
-      - run: chmod +x gradlew
-      - run: ./gradlew build --stacktrace
+- name: Upload native debug logs
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: native-build-logs
+    path: |
+      build_debug_logs.tgz
+      build_debug_logs/
+      gradle_full.log
