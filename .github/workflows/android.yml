@@ -1,7 +1,16 @@
-name: CI - Native build debug (show first compiler error)
+name: Full Android Native Build (auto-clone Dobby if missing + diagnostics)
 
 on:
   workflow_dispatch:
+    inputs:
+      dobby_repo_url:
+        description: 'Optional: git URL to clone Dobby into app/src/main/cpp/extern/Dobby if missing. Leave blank to use default (public jmpews/Dobby).'
+        required: false
+        default: 'https://github.com/jmpews/Dobby.git'
+      clone_dobby:
+        description: 'If true, clone Dobby into app/src/main/cpp/extern/Dobby when missing (default true).'
+        required: false
+        default: 'true'
   push:
     branches: [ "main" ]
   pull_request:
@@ -11,25 +20,51 @@ permissions:
   contents: write
 
 jobs:
-  debug-native:
+  build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
+      - name: Prevent loop when triggered by actions bot
+        if: ${{ github.actor == 'github-actions[bot]' }}
+        run: |
+          echo "Triggered by github-actions[bot] — exiting to avoid loop."
+          exit 0
+
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Install p7zip (optional; safe)
-        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+      - name: Ensure Dobby exists (clone if missing and allowed)
+        run: |
+          set -euo pipefail
+          TARGET="app/src/main/cpp/extern/Dobby"
+          if [ -d "$TARGET" ]; then
+            echo "Dobby already present at $TARGET"
+            exit 0
+          fi
+          if [ "${{ github.event.inputs.clone_dobby }}" != "true" ]; then
+            echo "clone_dobby is false and Dobby missing — continuing, but build may fail."
+            exit 0
+          fi
+          URL="${{ github.event.inputs.dobby_repo_url }}"
+          if [ -z "$URL" ]; then
+            echo "No dobby_repo_url provided and clone_dobby=true; nothing to clone. Continuing (build may fail)."
+            exit 0
+          fi
+          echo "Cloning Dobby from $URL into $TARGET"
+          mkdir -p "$(dirname "$TARGET")"
+          git clone --depth 1 "$URL" "$TARGET"
 
       - name: Show C++ tree & CMakeLists (quick view)
         run: |
           echo "PWD: $(pwd)"
           echo "=== app/src/main/cpp tree (maxdepth 3) ==="
           find app/src/main/cpp -maxdepth 3 -type f -print || true
-          echo "=== First 200 lines of app/src/main/cpp/CMakeLists.txt ==="
+          echo "=== First 200 lines of CMakeLists if present ==="
           sed -n '1,200p' app/src/main/cpp/CMakeLists.txt || true
 
       - name: Set up JDK 17
@@ -39,10 +74,9 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Ensure Android SDK tools & packages (platform-tools, ndk, cmake)
+      - name: Install Android SDK command-line tools + packages
         run: |
           set -euxo pipefail
-          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
           mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
           if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
             echo "Installing Android command line tools..."
@@ -54,63 +88,64 @@ jobs:
             mv cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
           fi
           export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
+          # Install common packages (adjust API levels if your project requires other versions)
           yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;26.1.10909125" "cmake;3.22.1" || true
 
-      - name: Grant execute for gradlew
+      - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Run Gradle build (capture full output)
-        id: run_gradle
+      - name: Run Gradle assembleDebug (capture full output)
+        id: gradle_run
         continue-on-error: true
         run: |
           set -o pipefail
-          # choose target: you can replace :app:assembleDebug with :app:build if desired
+          # Capture full output for later inspection
           ./gradlew :app:assembleDebug --stacktrace --info 2>&1 | tee gradle_full.log
           echo "exit_code=$?" >> $GITHUB_OUTPUT
 
-      - name: Gather CMake / Ninja logs (if any)
+      - name: Gather CMake/Ninja logs into artifact dir
         if: always()
         run: |
-          mkdir -p build_debug_logs
-          cp -v gradle_full.log build_debug_logs/ || true
-          # copy CMakeError/Output and build.ninja files
-          find app/.cxx -type f -name 'CMakeError.log' -o -name 'CMakeOutput.log' -o -name 'build.ninja' -o -name '*.log' -print -exec cp --parents {} build_debug_logs/ \; || true
-          tar -czf build_debug_logs.tgz build_debug_logs || true
+          set -euo pipefail || true
+          mkdir -p native_logs
+          cp -v gradle_full.log native_logs/ 2>/dev/null || true
+          # copy generated CMake/Ninja files under app/.cxx (if any)
+          if [ -d app/.cxx ]; then
+            find app/.cxx -type f -print -exec cp --parents {} native_logs/ \; || true
+          fi
+          # copy any other useful CMake files
+          find . -type f -name 'CMakeError.log' -o -name 'CMakeOutput.log' -o -name 'build.ninja' -o -name 'CMakeCache.txt' -print -exec cp --parents {} native_logs/ \; || true
+          tar -czf native_logs.tgz native_logs || true
+          ls -lh native_logs.tgz || true
 
-      - name: Show the first native/compiler/linker error (with context) and fail clearly
+      - name: Print first likely native error snippet (fail clearly if build failed)
         if: always()
         run: |
           set -euo pipefail
           LOG=gradle_full.log
           if [ ! -f "$LOG" ]; then
-            echo "No gradle_full.log found — failing for inspection."
+            echo "No gradle_full.log — failing for inspection."
             exit 1
           fi
 
-          # Find first line number with likely native/compiler/linker error
-          # We look for typical patterns: "error:", "fatal error:", "undefined reference to", "ld: error"
-          ERR_LINE=$(awk 'BEGIN{IGNORECASE=1} /fatal error:|undefined reference to|ld: error| error: / { print NR; exit }' "$LOG" || true)
+          # Search aggressively for native compiler/configure/linker errors
+          # Look for: fatal error, error:, undefined reference to, ld: error, CMake Error
+          ERR_LINE=$(awk 'BEGIN{IGNORECASE=1} /fatal error:|undefined reference to|ld: error|cmake error|CMake Error| error: / { print NR; exit }' "$LOG" || true)
 
           if [ -z "$ERR_LINE" ]; then
-            echo "No obvious native compiler/linker error found in gradle_full.log."
-            echo "Printing last 200 lines of the log for manual inspection:"
-            tail -n 200 "$LOG" || true
-            # still upload artifacts (next step) and fail so you can inspect in UI if desired
-            echo "No clear compiler error detected — failing to force inspection."
+            echo "No obvious native compiler/linker/configure error detected by heuristic search."
+            echo "Printing last 400 lines of gradle_full.log:"
+            tail -n 400 "$LOG" || true
+            echo "Full logs uploaded as artifact 'native-build-logs'. Failing to force inspection."
             exit 1
           fi
 
-          # compute context window
-          START=$(( ERR_LINE > 15 ? ERR_LINE - 15 : 1 ))
-          END=$(( ERR_LINE + 40 ))
-
-          echo "==== Found probable native error at log line $ERR_LINE ===="
-          echo "==== Showing context (lines $START to $END) from gradle_full.log ===="
+          START=$(( ERR_LINE > 20 ? ERR_LINE - 20 : 1 ))
+          END=$(( ERR_LINE + 80 ))
+          echo "==== Probable native/CMake error found at gradle_full.log line $ERR_LINE ===="
           sed -n "${START},${END}p" "$LOG" || true
-          echo "==== End of snippet ===="
-          echo ""
-          echo "Full log and CMake/Ninja files are uploaded as artifact 'native-build-logs'."
-          # fail to indicate CI failure with clear message
+          echo "==== End snippet ===="
+          echo "Full logs uploaded as artifact 'native-build-logs'."
           exit 1
 
       - name: Upload native build logs artifact
@@ -120,6 +155,6 @@ jobs:
           name: native-build-logs
           path: |
             gradle_full.log
-            build_debug_logs.tgz
-            build_debug_logs/
+            native_logs.tgz
+            native_logs/
 
