@@ -1,16 +1,21 @@
-name: Full Android Native Build (auto-clone Dobby if missing + diagnostics)
+name: CI — ensure Dobby + Android native build
 
 on:
   workflow_dispatch:
     inputs:
       dobby_repo_url:
-        description: 'Optional: git URL to clone Dobby into app/src/main/cpp/extern/Dobby if missing. Leave blank to use default (public jmpews/Dobby).'
+        description: 'Optional: git URL to clone Dobby into app/src/main/cpp/extern/Dobby if missing. Default public jmpews/Dobby.'
         required: false
         default: 'https://github.com/jmpews/Dobby.git'
       clone_dobby:
-        description: 'If true, clone Dobby into app/src/main/cpp/extern/Dobby when missing (default true).'
+        description: 'If "true", clone Dobby when missing. Set false to rely only on submodules/present files.'
         required: false
         default: 'true'
+      private_token_secret:
+        description: 'Name of the secret that contains a token for private Dobby repo (e.g. GH_TOKEN). Leave blank to clone publicly.'
+        required: false
+        default: ''
+
   push:
     branches: [ "main" ]
   pull_request:
@@ -19,54 +24,98 @@ on:
 permissions:
   contents: write
 
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      - name: Prevent loop when triggered by actions bot
-        if: ${{ github.actor == 'github-actions[bot]' }}
-        run: |
-          echo "Triggered by github-actions[bot] — exiting to avoid loop."
-          exit 0
-
-      - name: Checkout (with submodules)
+      - name: Checkout repository (with submodules)
         uses: actions/checkout@v4
         with:
-         fetch-depth: 0
-         submodules: recursive
+          fetch-depth: 0
+          submodules: recursive
 
+      - name: Show quick repo status (debug)
+        run: |
+          echo "pwd: $(pwd)"
+          echo "Top-level files:"
+          ls -la || true
+          echo ".gitmodules (if any):"
+          if [ -f .gitmodules ]; then cat .gitmodules; else echo "<none>"; fi
+          echo "Listing app/src/main/cpp extern tree:"
+          ls -la app/src/main/cpp || true
+          ls -la app/src/main/cpp/extern || true
 
-      - name: Ensure Dobby exists (clone if missing and allowed)
+      - name: Ensure extern/Dobby exists (clone fallback if missing)
+        id: ensure_dobby
         run: |
           set -euo pipefail
           TARGET="app/src/main/cpp/extern/Dobby"
           if [ -d "$TARGET" ]; then
             echo "Dobby already present at $TARGET"
+            echo "status=present" >> $GITHUB_OUTPUT
             exit 0
           fi
+
           if [ "${{ github.event.inputs.clone_dobby }}" != "true" ]; then
-            echo "clone_dobby is false and Dobby missing — continuing, but build may fail."
+            echo "clone_dobby=false and Dobby missing — continuing and build may fail"
+            echo "status=missing" >> $GITHUB_OUTPUT
             exit 0
           fi
+
           URL="${{ github.event.inputs.dobby_repo_url }}"
           if [ -z "$URL" ]; then
-            echo "No dobby_repo_url provided and clone_dobby=true; nothing to clone. Continuing (build may fail)."
+            echo "No dobby_repo_url provided — skipping clone (build may fail)"
+            echo "status=missing" >> $GITHUB_OUTPUT
             exit 0
           fi
-          echo "Cloning Dobby from $URL into $TARGET"
-          mkdir -p "$(dirname "$TARGET")"
-          git clone --depth 1 "$URL" "$TARGET"
 
-      - name: Show C++ tree & CMakeLists (quick view)
+          echo "Dobby not found — cloning from $URL into $TARGET"
+
+          mkdir -p "$(dirname "$TARGET")"
+
+          # If user supplied a secret name, use it for private repo cloning. Else clone public.
+          SECRET_NAME="${{ github.event.inputs.private_token_secret }}"
+          if [ -n "$SECRET_NAME" ]; then
+            echo "Using provided secret name '$SECRET_NAME' to clone private repo."
+            # Resolve secret value (will be empty if not set); user must set repo secret with this name
+            TOKEN="${{ secrets[github.event.inputs.private_token_secret] || '' }}"
+            if [ -z "$TOKEN" ]; then
+              echo "Secret '$SECRET_NAME' not set or empty. Attempting public clone of $URL"
+              git clone --depth 1 "$URL" "$TARGET"
+            else
+              # Convert https://github.com/owner/repo.git -> https://x-access-token:TOKEN@github.com/owner/repo.git
+              # NOTE: Keep token usage secure and stored in GitHub Secrets.
+              PROTO_HOST=$(echo "$URL" | sed -n 's#^\(https://\)\(.*\)#\1\2#p' || true)
+              if echo "$URL" | grep -qi '^https://'; then
+                # insert token
+                CLONE_URL=$(echo "$URL" | sed -E "s#https://#https://x-access-token:${TOKEN}@#")
+                git clone --depth 1 "$CLONE_URL" "$TARGET"
+              else
+                echo "Private token cloning only supports HTTPS URLs. Attempting direct git clone of $URL"
+                git clone --depth 1 "$URL" "$TARGET"
+              fi
+            fi
+          else
+            # public clone
+            git clone --depth 1 "$URL" "$TARGET"
+          fi
+
+          echo "status=cloned" >> $GITHUB_OUTPUT
+
+      - name: Confirm Dobby location (debug)
         run: |
-          echo "PWD: $(pwd)"
-          echo "=== app/src/main/cpp tree (maxdepth 3) ==="
-          find app/src/main/cpp -maxdepth 3 -type f -print || true
-          echo "=== First 200 lines of CMakeLists if present ==="
-          sed -n '1,200p' app/src/main/cpp/CMakeLists.txt || true
+          echo "dobby check:"
+          if [ -d app/src/main/cpp/extern/Dobby ]; then
+            echo "-> app/src/main/cpp/extern/Dobby exists"
+            ls -la app/src/main/cpp/extern/Dobby | sed -n '1,120p' || true
+          else
+            echo "-> app/src/main/cpp/extern/Dobby NOT present"
+            find app/src/main/cpp -maxdepth 4 -type d -iname '*dobby*' -print || true
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -75,21 +124,21 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Install Android SDK command-line tools + packages
+      - name: Install Android cmdline-tools, NDK & CMake (if missing)
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
           if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            echo "Installing Android command line tools..."
+            echo "Installing Android command-line tools..."
             cd /tmp
-            curl -fSLo commandlinetools.zip "https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip"
+            curl -fsSL -o commandlinetools.zip "https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip"
             unzip -q commandlinetools.zip
             rm -f commandlinetools.zip
             mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
             mv cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
           fi
           export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
-          # Install common packages (adjust API levels if your project requires other versions)
+          # Adjust package versions if your project requires other platform/build-tools/ndk/cmake versions
           yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;26.1.10909125" "cmake;3.22.1" || true
 
       - name: Grant execute permission for gradlew
@@ -100,39 +149,33 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          # Capture full output for later inspection
           ./gradlew :app:assembleDebug --stacktrace --info 2>&1 | tee gradle_full.log
           echo "exit_code=$?" >> $GITHUB_OUTPUT
 
-      - name: Gather CMake/Ninja logs into artifact dir
+      - name: Gather CMake/Ninja logs and upload artifact
         if: always()
         run: |
           set -euo pipefail || true
           mkdir -p native_logs
-          cp -v gradle_full.log native_logs/ 2>/dev/null || true
-          # copy generated CMake/Ninja files under app/.cxx (if any)
+          cp -v gradle_full.log native_logs/ || true
           if [ -d app/.cxx ]; then
             find app/.cxx -type f -print -exec cp --parents {} native_logs/ \; || true
           fi
-          # copy any other useful CMake files
           find . -type f -name 'CMakeError.log' -o -name 'CMakeOutput.log' -o -name 'build.ninja' -o -name 'CMakeCache.txt' -print -exec cp --parents {} native_logs/ \; || true
           tar -czf native_logs.tgz native_logs || true
           ls -lh native_logs.tgz || true
 
-      - name: Print first likely native error snippet (fail clearly if build failed)
+      - name: Print first probable native error snippet (fail clearly if build failed)
         if: always()
         run: |
           set -euo pipefail
           LOG=gradle_full.log
           if [ ! -f "$LOG" ]; then
-            echo "No gradle_full.log — failing for inspection."
+            echo "No gradle_full.log found — failing for inspection"
             exit 1
           fi
 
-          # Search aggressively for native compiler/configure/linker errors
-          # Look for: fatal error, error:, undefined reference to, ld: error, CMake Error
           ERR_LINE=$(awk 'BEGIN{IGNORECASE=1} /fatal error:|undefined reference to|ld: error|cmake error|CMake Error| error: / { print NR; exit }' "$LOG" || true)
-
           if [ -z "$ERR_LINE" ]; then
             echo "No obvious native compiler/linker/configure error detected by heuristic search."
             echo "Printing last 400 lines of gradle_full.log:"
@@ -143,7 +186,7 @@ jobs:
 
           START=$(( ERR_LINE > 20 ? ERR_LINE - 20 : 1 ))
           END=$(( ERR_LINE + 80 ))
-          echo "==== Probable native/CMake error found at gradle_full.log line $ERR_LINE ===="
+          echo "==== Probable native error at gradle_full.log line $ERR_LINE ===="
           sed -n "${START},${END}p" "$LOG" || true
           echo "==== End snippet ===="
           echo "Full logs uploaded as artifact 'native-build-logs'."
@@ -158,4 +201,3 @@ jobs:
             gradle_full.log
             native_logs.tgz
             native_logs/
-
