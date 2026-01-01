@@ -1,36 +1,108 @@
-name: Android CI - clone Dobby, fix gradlew, build & upload .so
+name: CI - ensure Dobby, build native, show first native error + artifacts
 
 on:
-  push:
-    branches: ["main"]
   workflow_dispatch:
+    inputs:
+      dobby_repo_url:
+        description: 'Optional public git URL to clone Dobby into app/src/main/cpp/extern/Dobby if missing'
+        required: false
+        default: 'https://github.com/jmpews/Dobby.git'
+      private_token_secret:
+        description: 'Optional secret name that contains token for private Dobby repo (e.g. GH_TOKEN). Leave blank for public clone.'
+        required: false
+        default: ''
+      clone_dobby:
+        description: 'If "true", clone Dobby when missing'
+        required: false
+        default: 'true'
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # we do clone fallback, but allow submodules if present
+          submodules: recursive
 
-      - name: Ensure extern/Dobby exists (clone if missing)
+      - name: Quick repo debug (paths & .gitmodules)
         run: |
-          DOBBY_PATH="app/src/main/cpp/extern/Dobby"
-          if [ ! -d "$DOBBY_PATH" ]; then
-            mkdir -p app/src/main/cpp/extern
-            git clone --depth 1 https://github.com/jmpews/Dobby.git "$DOBBY_PATH"
-          else
-            echo "Dobby already present"
-          fi
+          echo "PWD: $(pwd)"
+          echo ".gitmodules (if present):"
+          [ -f .gitmodules ] && cat .gitmodules || echo "<none>"
+          echo "Listing app/src/main/cpp (top-level):"
+          ls -la app/src/main/cpp || true
+          echo "Listing extern (if any):"
           ls -la app/src/main/cpp/extern || true
+
+      - name: Ensure extern/Dobby exists (clone fallback if missing)
+        id: ensure_dobby
+        run: |
+          set -euo pipefail
+          TARGET="app/src/main/cpp/extern/Dobby"
+          if [ -d "$TARGET" ]; then
+            echo "Dobby already present at $TARGET"
+            echo "status=present" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "${{ github.event.inputs.clone_dobby }}" != "true" ]; then
+            echo "clone_dobby=false and Dobby missing — continuing (build may fail)"
+            echo "status=missing" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          URL="${{ github.event.inputs.dobby_repo_url }}"
+          if [ -z "$URL" ]; then
+            echo "No dobby_repo_url provided — skipping clone (build may fail)"
+            echo "status=missing" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Cloning Dobby from $URL into $TARGET"
+          mkdir -p "$(dirname "$TARGET")"
+
+          SECRET_NAME="${{ github.event.inputs.private_token_secret }}"
+          if [ -n "$SECRET_NAME" ]; then
+            # attempt to read the secret value (user must create repository secret with this name)
+            TOKEN="${{ secrets[github.event.inputs.private_token_secret] || '' }}"
+            if [ -n "$TOKEN" ] && echo "$URL" | grep -qi '^https://'; then
+              CLONE_URL=$(echo "$URL" | sed -E "s#https://#https://x-access-token:${TOKEN}@#")
+              git clone --depth 1 "$CLONE_URL" "$TARGET"
+            else
+              echo "Secret not set or URL not https; falling back to public clone attempt"
+              git clone --depth 1 "$URL" "$TARGET"
+            fi
+          else
+            git clone --depth 1 "$URL" "$TARGET"
+          fi
+
+          echo "status=cloned" >> $GITHUB_OUTPUT
+
+      - name: Verify Dobby contents (debug)
+        run: |
+          if [ -d app/src/main/cpp/extern/Dobby ]; then
+            echo "Dobby folder present — sample listing:"
+            ls -la app/src/main/cpp/extern/Dobby | sed -n '1,120p' || true
+          else
+            echo "Dobby NOT present. Searching for similarly-named folders:"
+            find app/src/main/cpp -maxdepth 4 -iname '*dobby*' -print || true
+          fi
 
       - name: Make gradlew executable (CI fix)
         run: |
+          # try to record executable bit in index (harmless if not permitted)
           git update-index --chmod=+x gradlew || true
+          # fix CRLFs (harmless)
           sed -i 's/\r$//' gradlew || true
           chmod +x gradlew
           ls -la gradlew
@@ -39,35 +111,114 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
+          cache: gradle
 
-      - name: Setup Android SDK (cmdline tools)
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK & CMake
+      - name: Install Android cmdline-tools (if missing)
         run: |
+          set -euxo pipefail
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "Installing Android command-line tools..."
+            cd /tmp
+            curl -fsSL -o commandlinetools.zip "https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip"
+            unzip -q commandlinetools.zip
+            rm -f commandlinetools.zip
+            mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
+            mv cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
+          fi
+          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
+          yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "platform-tools" "platforms;android-33" "build-tools;33.0.2" || true
+
+      - name: Install NDK & CMake required by project
+        run: |
+          set -euo pipefail
+          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
           yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "ndk;26.1.10909125" "cmake;3.22.1" || true
 
-      - name: Clean (optional, forces reconfigure)
-        run: ./gradlew clean
+      - name: Run Gradle assembleDebug and capture full output (native build included)
+        id: run_gradle
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          echo "Running: ./gradlew :app:assembleDebug --stacktrace --info"
+          ./gradlew :app:assembleDebug --stacktrace --info 2>&1 | tee gradle_full.log || true
+          echo "gradle_exit=$?" >> $GITHUB_OUTPUT
 
-      - name: Build Debug (assemble includes native .so)
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+      - name: Gather CMake/Ninja/native logs & .so outputs (always)
+        if: always()
+        run: |
+          set -euo pipefail || true
+          mkdir -p native_debug native_artifacts
+          cp -v gradle_full.log native_debug/ 2>/dev/null || true
 
-      - name: Collect .so files and upload
+          # collect CMake/Ninja logs
+          if [ -d app/.cxx ]; then
+            find app/.cxx -type f -print -exec cp --parents {} native_debug/ \; || true
+          fi
+          find . -type f -name 'CMakeError.log' -o -name 'CMakeOutput.log' -o -name 'build.ninja' -o -name 'CMakeCache.txt' -print -exec cp --parents {} native_debug/ \; || true
+
+          # collect .so files (common build output locations)
+          find app/.cxx -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
+          find app/build -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
+          find app/build/intermediates/merged_native_libs -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
+
+          # list what we gathered
+          echo "=== native_debug content ==="
+          find native_debug -maxdepth 5 -type f -print || true
+          echo "=== native_artifacts (.so) content ==="
+          find native_artifacts -maxdepth 5 -type f -print || true
+
+          tar -czf native_debug.tgz native_debug || true
+          tar -czf native_artifacts.tgz native_artifacts || true
+          ls -lh native_debug.tgz native_artifacts.tgz || true
+
+      - name: Print first probable native/CMake/compiler/linker error (fail clearly)
         if: always()
         run: |
           set -euo pipefail
-          mkdir -p native_artifacts
-          # collect typical locations
-          find app/.cxx -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
-          find app/build -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
-          echo "Found:"
-          find native_artifacts -type f -name '*.so' -print || true
+          LOG=gradle_full.log
+          if [ ! -f "$LOG" ]; then
+            echo "No gradle_full.log found — failing for inspection."
+            exit 1
+          fi
 
-      - name: Upload native-shared-libs artifact
+          # aggressive search for first likely native error
+          ERR_LINE=$(awk 'BEGIN{IGNORECASE=1} /fatal error:|undefined reference to|ld: error|CMake Error|cmake error| error: / { print NR; exit }' "$LOG" || true)
+
+          if [ -z "$ERR_LINE" ]; then
+            echo "No obvious native compiler/linker/configure error detected by heuristic search."
+            echo "Printing last 500 lines of gradle_full.log for manual inspection:"
+            tail -n 500 "$LOG" || true
+            echo "Full logs and artifacts uploaded as 'native-build-logs' and 'native-shared-libs'."
+            # fail so the run shows as failed and you inspect artifacts
+            exit 1
+          fi
+
+          START=$(( ERR_LINE > 30 ? ERR_LINE - 30 : 1 ))
+          END=$(( ERR_LINE + 120 ))
+          echo "==== Probable native/CMake error snippet (log lines $START..$END) ===="
+          sed -n "${START},${END}p" "$LOG" || true
+          echo "==== End snippet ===="
+          echo "Full logs and artifacts uploaded as 'native-build-logs' and 'native-shared-libs'."
+          # fail so the run is red and you can inspect artifacts
+          exit 1
+
+      - name: Upload native debug logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-logs
+          path: |
+            gradle_full.log
+            native_debug.tgz
+            native_debug/
+
+      - name: Upload native .so artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-shared-libs
-          path: native_artifacts
+          path: |
+            native_artifacts.tgz
+            native_artifacts/
