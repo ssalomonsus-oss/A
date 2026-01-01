@@ -1,39 +1,125 @@
-# Insert into your job BEFORE running ./gradlew build
-- name: Show C++ source tree & CMakeLists
-  run: |
-    echo ">>> app/src/main/cpp tree"
-    find app/src/main/cpp -maxdepth 3 -type f -print || true
-    echo ">>> show CMakeLists first 200 lines"
-    sed -n '1,200p' app/src/main/cpp/CMakeLists.txt || true
+name: CI - Native build debug (show first compiler error)
 
-- name: Build with Gradle (verbose native logs)
-  id: gradle_build
-  run: |
-    set -o pipefail
-    # Run assembleDebug (or build) with info/stacktrace to surface native compile errors
-    ./gradlew :app:assembleDebug --stacktrace --info 2>&1 | tee gradle_full.log
-  continue-on-error: true
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
-# Collect generated native build logs and upload for inspection
-- name: Gather native build logs
-  if: always()
-  run: |
-    mkdir -p build_debug_logs
-    cp gradle_full.log build_debug_logs/ || true
-    # copy any CMake/Ninja outputs created by the build
-    find app/.cxx -maxdepth 6 -type f -name '*.log' -print -exec cp --parents {} build_debug_logs/ \; || true
-    find app/.cxx -maxdepth 6 -type f -name 'CMakeOutput.log' -print -exec cp --parents {} build_debug_logs/ \; || true
-    find app/.cxx -maxdepth 6 -type f -name 'CMakeError.log' -print -exec cp --parents {} build_debug_logs/ \; || true
-    # capture build.ninja and CMakeFiles if present
-    find app/.cxx -type f -name 'build.ninja' -print -exec cp --parents {} build_debug_logs/ \; || true
-    tar -czf build_debug_logs.tgz build_debug_logs || true
+permissions:
+  contents: write
 
-- name: Upload native debug logs
-  if: always()
-  uses: actions/upload-artifact@v4
-  with:
-    name: native-build-logs
-    path: |
-      build_debug_logs.tgz
-      build_debug_logs/
-      gradle_full.log
+jobs:
+  debug-native:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install p7zip (optional; safe)
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Show C++ tree & CMakeLists (quick view)
+        run: |
+          echo "PWD: $(pwd)"
+          echo "=== app/src/main/cpp tree (maxdepth 3) ==="
+          find app/src/main/cpp -maxdepth 3 -type f -print || true
+          echo "=== First 200 lines of app/src/main/cpp/CMakeLists.txt ==="
+          sed -n '1,200p' app/src/main/cpp/CMakeLists.txt || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Ensure Android SDK tools & packages (platform-tools, ndk, cmake)
+        run: |
+          set -euxo pipefail
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          if [ ! -x "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "Installing Android command line tools..."
+            cd /tmp
+            curl -fSLo commandlinetools.zip "https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip"
+            unzip -q commandlinetools.zip
+            rm -f commandlinetools.zip
+            mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
+            mv cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
+          fi
+          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
+          yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;26.1.10909125" "cmake;3.22.1" || true
+
+      - name: Grant execute for gradlew
+        run: chmod +x gradlew
+
+      - name: Run Gradle build (capture full output)
+        id: run_gradle
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # choose target: you can replace :app:assembleDebug with :app:build if desired
+          ./gradlew :app:assembleDebug --stacktrace --info 2>&1 | tee gradle_full.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Gather CMake / Ninja logs (if any)
+        if: always()
+        run: |
+          mkdir -p build_debug_logs
+          cp -v gradle_full.log build_debug_logs/ || true
+          # copy CMakeError/Output and build.ninja files
+          find app/.cxx -type f -name 'CMakeError.log' -o -name 'CMakeOutput.log' -o -name 'build.ninja' -o -name '*.log' -print -exec cp --parents {} build_debug_logs/ \; || true
+          tar -czf build_debug_logs.tgz build_debug_logs || true
+
+      - name: Show the first native/compiler/linker error (with context) and fail clearly
+        if: always()
+        run: |
+          set -euo pipefail
+          LOG=gradle_full.log
+          if [ ! -f "$LOG" ]; then
+            echo "No gradle_full.log found — failing for inspection."
+            exit 1
+          fi
+
+          # Find first line number with likely native/compiler/linker error
+          # We look for typical patterns: "error:", "fatal error:", "undefined reference to", "ld: error"
+          ERR_LINE=$(awk 'BEGIN{IGNORECASE=1} /fatal error:|undefined reference to|ld: error| error: / { print NR; exit }' "$LOG" || true)
+
+          if [ -z "$ERR_LINE" ]; then
+            echo "No obvious native compiler/linker error found in gradle_full.log."
+            echo "Printing last 200 lines of the log for manual inspection:"
+            tail -n 200 "$LOG" || true
+            # still upload artifacts (next step) and fail so you can inspect in UI if desired
+            echo "No clear compiler error detected — failing to force inspection."
+            exit 1
+          fi
+
+          # compute context window
+          START=$(( ERR_LINE > 15 ? ERR_LINE - 15 : 1 ))
+          END=$(( ERR_LINE + 40 ))
+
+          echo "==== Found probable native error at log line $ERR_LINE ===="
+          echo "==== Showing context (lines $START to $END) from gradle_full.log ===="
+          sed -n "${START},${END}p" "$LOG" || true
+          echo "==== End of snippet ===="
+          echo ""
+          echo "Full log and CMake/Ninja files are uploaded as artifact 'native-build-logs'."
+          # fail to indicate CI failure with clear message
+          exit 1
+
+      - name: Upload native build logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-logs
+          path: |
+            gradle_full.log
+            build_debug_logs.tgz
+            build_debug_logs/
+
