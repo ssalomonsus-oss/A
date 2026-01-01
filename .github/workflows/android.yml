@@ -1,41 +1,73 @@
-name: Build Android .so
+name: Android CI - clone Dobby, fix gradlew, build & upload .so
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: true   # REQUIRED if you use extern libs
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: temurin
-        java-version: 17
+      - name: Ensure extern/Dobby exists (clone if missing)
+        run: |
+          DOBBY_PATH="app/src/main/cpp/extern/Dobby"
+          if [ ! -d "$DOBBY_PATH" ]; then
+            mkdir -p app/src/main/cpp/extern
+            git clone --depth 1 https://github.com/jmpews/Dobby.git "$DOBBY_PATH"
+          else
+            echo "Dobby already present"
+          fi
+          ls -la app/src/main/cpp/extern || true
 
-    - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
+      - name: Make gradlew executable (CI fix)
+        run: |
+          git update-index --chmod=+x gradlew || true
+          sed -i 's/\r$//' gradlew || true
+          chmod +x gradlew
+          ls -la gradlew
 
-    - name: Accept licenses
-      run: yes | sdkmanager --licenses
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
 
-    - name: Install NDK + CMake
-      run: |
-        sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
+      - name: Setup Android SDK (cmdline tools)
+        uses: android-actions/setup-android@v3
 
-    - name: Build native libs
-      run: ./gradlew :app:assembleDebug
+      - name: Install NDK & CMake
+        run: |
+          yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "ndk;26.1.10909125" "cmake;3.22.1" || true
 
-    - name: Upload .so
-      uses: actions/upload-artifact@v4
-      with:
-        name: native-libs
-        path: |
-          app/build/intermediates/cxx/**/obj/**/*.so
+      - name: Clean (optional, forces reconfigure)
+        run: ./gradlew clean
+
+      - name: Build Debug (assemble includes native .so)
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Collect .so files and upload
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p native_artifacts
+          # collect typical locations
+          find app/.cxx -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
+          find app/build -type f -name '*.so' -print -exec cp --parents '{}' native_artifacts/ \; || true
+          echo "Found:"
+          find native_artifacts -type f -name '*.so' -print || true
+
+      - name: Upload native-shared-libs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-shared-libs
+          path: native_artifacts
